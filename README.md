@@ -38,6 +38,18 @@ Berikut adalah panduan lengkap untuk menggunakan model kami:
 pip install catboost torchvision transformers numpy pandas pillow joblib
 ```
 
+## 2. Download Model
+
+Download file model yang sudah ditraining dari repository ini:
+
+```bash
+# Download best_model.pkl
+wget https://github.com/asShidqi/return-refund-prediction/raw/main/best_model.pkl
+```
+
+Atau download secara manual dari:
+- [best_model.pkl](best_model.pkl)
+
 ## 2. Kode Implementasi
 
 ```python
