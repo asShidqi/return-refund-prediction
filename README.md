@@ -35,7 +35,13 @@ Berikut adalah panduan lengkap untuk menggunakan model kami:
 ## 1. Instalasi Dependencies
 
 ```bash
-pip install catboost torchvision transformers numpy pandas pillow joblib
+pip install catboost torchvision transformers numpy pandas pillow joblib peft huggingface-hub
+```
+
+Atau instal semua dependencies dari file requirements:
+
+```bash
+pip install -r requirements.txt
 ```
 
 ## 2. Download Model
@@ -131,3 +137,160 @@ print("Prediction:", prediction)
 Model akan memberikan prediksi berupa:
 - `0`: Klaim palsu
 - `1`: Klaim valid
+
+# Implementasi Model Finetune
+
+Berikut adalah kode implementasi setelah proses fine-tuning model:
+
+```python
+import torch
+import torch.nn as nn
+from transformers import AutoModel, AutoTokenizer, AutoImageProcessor
+from peft import get_peft_model, PeftModel, LoraConfig
+from PIL import Image
+import numpy as np
+import joblib
+import catboost
+from huggingface_hub import hf_hub_download
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -------------------------
+# 1. Helper load image
+# -------------------------
+def load_image(path):
+    return Image.open(path).convert("RGB")
+
+# -------------------------
+# 2. Define SiameseModel (projection head + backbone)
+# -------------------------
+class SiameseModel(nn.Module):
+    def __init__(self, backbone, emb_dim=256, pool="cls", normalize=True):
+        super().__init__()
+        self.backbone = backbone
+        self.pool = pool
+        self.normalize = normalize
+        hidden_size = getattr(backbone.config, "hidden_size", 1024)
+        self.proj = nn.Sequential(
+            nn.Linear(hidden_size, max(hidden_size // 2, emb_dim)),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(max(hidden_size // 2, emb_dim), emb_dim)
+        )
+
+    def _safe_forward(self, module, **kwargs):
+        return module.forward(**kwargs)
+
+    def encode(self, pixel: torch.Tensor):
+        out = self._safe_forward(self.backbone, pixel_values=pixel, return_dict=True)
+        if hasattr(out, "pooler_output") and out.pooler_output is not None:
+            h = out.pooler_output
+        else:
+            h = out.last_hidden_state[:, 0, :]
+        emb = self.proj(h)
+        if self.normalize:
+            emb = nn.functional.normalize(emb, dim=-1)
+        return emb
+
+# -------------------------
+# 3. Load DINO backbone + LoRA + projection head
+# -------------------------
+backbone_dino = AutoModel.from_pretrained("facebook/dinov2-large")
+lora_cfg = LoraConfig(
+    r=8, lora_alpha=16, target_modules=["query","value"], lora_dropout=0.1,
+    bias="none", task_type="FEATURE_EXTRACTION"
+)
+backbone_dino = get_peft_model(backbone_dino, lora_cfg)
+backbone_dino.to(device)
+
+# Load projection head + backbone weights
+model_dino = SiameseModel(backbone_dino).to(device)
+path_proj = hf_hub_download(
+    repo_id="shidqii/dino-siamese-full",
+    filename="siamese_model.pt"
+)
+state_dict = torch.load(path_proj, map_location=device)
+model_dino.load_state_dict(state_dict)
+model_dino.eval()
+
+processor_dino = AutoImageProcessor.from_pretrained("facebook/dinov2-large")
+
+# -------------------------
+# 4. Load Qwen LoRA from HuggingFace
+# -------------------------
+tokenizer_qwen = AutoTokenizer.from_pretrained("shidqii/qwen-embed-lora")
+base_model_qwen = AutoModel.from_pretrained("Qwen/Qwen3-Embedding-0.6B")
+model_qwen_lora = PeftModel.from_pretrained(base_model_qwen, "shidqii/qwen-embed-lora")
+model_qwen_lora.to(device)
+model_qwen_lora.eval()
+
+# -------------------------
+# 5. Load CatBoost
+# -------------------------
+cat_model = joblib.load("best_model_finetune.pkl")
+
+# -------------------------
+# 6. Helpers embed image & text
+# -------------------------
+@torch.no_grad()
+def embed_image(paths):
+    imgs = [load_image(p) for p in paths]
+    inputs = processor_dino(images=imgs, return_tensors="pt", padding=True).to(device)
+    emb = model_dino.encode(inputs["pixel_values"])
+    return emb.cpu().numpy()
+
+@torch.no_grad()
+def embed_caption(texts):
+    embs = []
+    for i in range(0, len(texts), 32):
+        batch = texts[i:i+32]
+        tokens = tokenizer_qwen(batch, padding=True, truncation=True, return_tensors="pt").to(device)
+        out = model_qwen_lora.base_model(**tokens)
+        last_hidden = out.last_hidden_state
+        mask = tokens["attention_mask"].unsqueeze(-1).expand(last_hidden.size())
+        mean_pooled = torch.sum(last_hidden * mask, 1) / torch.clamp(mask.sum(1), min=1e-9)
+        embs.append(mean_pooled.cpu())
+    return np.vstack(embs)
+
+# -------------------------
+# 7. Predict function
+# -------------------------
+def predict(img_main_path, img_review_path, caption):
+    img_emb = embed_image([img_main_path, img_review_path])
+    caption_emb = embed_caption([caption])[0]
+
+    features = np.concatenate([img_emb[0], img_emb[1], caption_emb])
+    return cat_model.predict([features])[0]
+
+# -------------------------
+# 8. Example usage
+# -------------------------
+result = predict(
+    "image-main.png",
+    "image-review.png",
+    "caption"
+)
+print("Predicted label:", result)
+```
+
+## Penjelasan Kode Finetune
+
+1. **Model Architecture**:
+   - **SiameseModel**: Kombinasi backbone dan projection head untuk ekstraksi fitur gambar
+   - **LoRA Configuration**: Parameter-Efficient Fine-Tuning (PEFT) untuk menyesuaikan model tanpa melatih seluruh parameter
+   - **Early Fusion**: Penggabungan fitur dari gambar dan teks sebelum klasifikasi
+
+2. **Komponen Utama**:
+   - **DINOv2 dengan LoRA**: Untuk ekstraksi fitur gambar yang lebih kuat
+   - **Qwen3 dengan LoRA**: Untuk embedding teks yang dioptimalkan untuk kasus penggunaan return-refund
+   - **CatBoost Classifier**: Model final untuk klasifikasi dengan gabungan fitur multimodal
+
+3. **Dependencies Tambahan**:
+   - `peft`: Untuk Parameter-Efficient Fine-Tuning
+   - `huggingface_hub`: Untuk mengunduh model terlatih dari repositori HuggingFace
+
+4. **Instalasi Dependencies Tambahan**:
+
+```bash
+pip install peft huggingface_hub
+```
